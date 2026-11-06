@@ -1,147 +1,737 @@
---[[
-    SCRIPT DI REGISTRAZIONE E RIPRODUZIONE MOVIMENTI
-    ------------------------------------------------
-    Questo script registra la posizione del tuo personaggio mentre ti muovi
-    e poi la riproduce esattamente come l'hai eseguita.
+--============================================================
+-- ROBLOX RECORDER - Registra e riproduci azioni
+-- Executor: Xeno
+-- Features: record, playback (con speed/loop), libreria, salvataggio
+--============================================================
 
-    ISTRUZIONI:
-    1. Incolla questo script in un "LocalScript" dentro StarterPlayer > StarterPlayerScripts.
-    2. Premi E per iniziare/fermare la registrazione.
-    3. Premi R per riprodurre la registrazione.
-    4. I dati vengono salvati in una tabella; puoi stamparli o salvarli su GitHub.
-
-    NOTA: Questo è un esempio didattico. Per funzionalità avanzate (animazioni,
-    input, loop, ecc.) puoi estendere il codice o usare framework come ReplayCore.
-]]
-
-local Players = game:GetService("Players")
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
+local CoreGui          = game:GetService("CoreGui")
+local HttpService      = game:GetService("HttpService")
+local TweenService     = game:GetService("TweenService")
+local LP               = Players.LocalPlayer
 
-local player = Players.LocalPlayer
-local character = player.Character or player.CharacterAdded:Wait()
-local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+--============================================================
+-- COLORI
+--============================================================
+local C = {
+    bg      = Color3.fromRGB(20, 20, 28),
+    panel   = Color3.fromRGB(30, 30, 42),
+    panel2  = Color3.fromRGB(40, 40, 54),
+    border  = Color3.fromRGB(60, 60, 80),
+    accent  = Color3.fromRGB(255, 140, 0),
+    accent2 = Color3.fromRGB(255, 180, 60),
+    text    = Color3.fromRGB(230, 230, 240),
+    textDim = Color3.fromRGB(150, 150, 170),
+    success = Color3.fromRGB(80, 210, 120),
+    danger  = Color3.fromRGB(230, 80, 80),
+    warning = Color3.fromRGB(250, 190, 70),
+    blue    = Color3.fromRGB(80, 150, 250),
+}
 
--- Configurazione tasti
-local RECORD_KEY = Enum.KeyCode.E
-local REPLAY_KEY = Enum.KeyCode.R
+--============================================================
+-- STATO
+--============================================================
+local S = {
+    recording = false,
+    playing = false,
+    recFrames = {},
+    recEvents = {},
+    recStartTime = 0,
+    lastRecTime = 0,
+    lastJump = false,
+    lastTool = nil,
+    recordRate = 20,
+    playbackStart = 0,
+    playbackIdx = 1,
+    playbackEvtIdx = 1,
+    playbackRec = nil,
+    speed = 1.0,
+    loop = false,
+    loopCount = 0,
+    totalRuns = 0,
+    saved = {},
+    lastProgressUpdate = 0,
+}
 
--- Stato
-local isRecording = false
-local isPlaying = false
-local recordedFrames = {} -- Ogni frame: {time = number, position = Vector3, cframe = CFrame}
+--============================================================
+-- UTILS
+--============================================================
+local function corner(p, r) local c = Instance.new("UICorner", p); c.CornerRadius = UDim.new(0, r or 6); return c end
+local function stroke(p, col, t) local s = Instance.new("UIStroke", p); s.Color = col or C.border; s.Thickness = t or 1; return s end
 
-local startTime = 0
-local recordConnection = nil
-
--- Funzione per iniziare/fermare la registrazione
-local function toggleRecording()
-    if isPlaying then
-        warn("Impossibile registrare durante la riproduzione.")
-        return
+local function getRoot()
+    local ch = LP.Character
+    return ch and ch:FindFirstChild("HumanoidRootPart")
+end
+local function getHum()
+    local ch = LP.Character
+    return ch and ch:FindFirstChildOfClass("Humanoid")
+end
+local function fmtTime(t)
+    local m = math.floor(t / 60)
+    local s = t - m * 60
+    return string.format("%d:%05.2f", m, s)
+end
+local function newBtn(parent, text, size, pos, color, cb)
+    local b = Instance.new("TextButton")
+    b.Size, b.Position = size, pos
+    b.BackgroundColor3 = color or C.panel2
+    b.Text = text
+    b.TextColor3 = C.text
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.AutoButtonColor = false
+    b.Parent = parent
+    corner(b, 6)
+    if cb then
+        b.MouseButton1Click:Connect(cb)
+        b.MouseEnter:Connect(function() TweenService:Create(b, TweenInfo.new(0.15), {BackgroundColor3 = color and color:Lerp(Color3.new(1,1,1), 0.15) or C.panel2}):Play() end)
+        b.MouseLeave:Connect(function() TweenService:Create(b, TweenInfo.new(0.15), {BackgroundColor3 = color or C.panel2}):Play() end)
     end
-
-    isRecording = not isRecording
-
-    if isRecording then
-        recordedFrames = {}
-        startTime = tick()
-        print("Registrazione avviata. Muoviti pure!")
-
-        -- Connessione a RenderStepped per catturare la posizione ogni frame
-        recordConnection = RunService.RenderStepped:Connect(function()
-            if not character or not humanoidRootPart then return end
-
-            local currentTime = tick() - startTime
-            local currentCFrame = humanoidRootPart.CFrame
-            local currentPosition = humanoidRootPart.Position
-
-            table.insert(recordedFrames, {
-                time = currentTime,
-                position = currentPosition,
-                cframe = currentCFrame,
-            })
-        end)
-    else
-        -- Ferma la registrazione
-        if recordConnection then
-            recordConnection:Disconnect()
-            recordConnection = nil
-        end
-
-        print(("Registrazione fermata. Frame catturati: %d"):format(#recordedFrames))
-        -- Qui puoi esportare `recordedFrames` (es. stamparli in JSON) per salvarli su GitHub
-    end
+    return b
+end
+local function newLabel(parent, text, size, pos, color, font, ts)
+    local l = Instance.new("TextLabel")
+    l.Size, l.Position = size, pos
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.TextColor3 = color or C.text
+    l.Font = font or Enum.Font.Gotham
+    l.TextSize = ts or 12
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = parent
+    return l
 end
 
--- Funzione per riprodurre la registrazione
-local function playRecording()
-    if isRecording then
-        warn("Impossibile riprodurre durante la registrazione.")
-        return
-    end
+--============================================================
+-- GUI PRINCIPALE
+--============================================================
+if CoreGui:FindFirstChild("XenoRecorderGUI") then CoreGui.XenoRecorderGUI:Destroy() end
 
-    if #recordedFrames == 0 then
-        warn("Nessuna registrazione disponibile.")
-        return
-    end
+local SG = Instance.new("ScreenGui")
+SG.Name = "XenoRecorderGUI"
+SG.ResetOnSpawn = false
+SG.DisplayOrder = 999
+SG.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+SG.Parent = CoreGui
 
-    if isPlaying then
-        warn("Riproduzione già in corso.")
-        return
-    end
+local Main = Instance.new("Frame")
+Main.Size = UDim2.new(0, 440, 0, 500)
+Main.Position = UDim2.new(0.5, -220, 0.5, -250)
+Main.BackgroundColor3 = C.bg
+Main.BorderSizePixel = 0
+Main.Active = true
+Main.Draggable = true
+Main.Parent = SG
+corner(Main, 10)
+stroke(Main, C.accent, 2)
 
-    isPlaying = true
-    print("Riproduzione avviata...")
+-- TITLE
+local TitleBar = Instance.new("Frame")
+TitleBar.Size = UDim2.new(1, -20, 0, 36)
+TitleBar.Position = UDim2.new(0, 10, 0, 8)
+TitleBar.BackgroundTransparency = 1
+TitleBar.Parent = Main
 
-    -- Disabilita i controlli del giocatore per evitare conflitti
-    local playerScripts = player:WaitForChild("PlayerScripts")
-    local playerModule = require(playerScripts:WaitForChild("PlayerModule"))
-    local controls = playerModule:GetControls()
-    controls:Disable()
+newLabel(TitleBar, "🎬 Xeno Recorder", UDim2.new(1, -40, 1, 0), UDim2.new(0, 0, 0, 0), C.accent, Enum.Font.GothamBold, 16)
 
-    -- Ciclo attraverso i frame registrati e imposta la posizione al momento giusto
-    local playbackStart = tick()
-    local playbackConnection
+local CloseBtn = newBtn(TitleBar, "✕", UDim2.new(0, 26, 0, 26), UDim2.new(1, -26, 0, 5), C.danger, function() SG:Destroy() end)
+CloseBtn.Font = Enum.Font.GothamBold
 
-    playbackConnection = RunService.RenderStepped:Connect(function()
-        if not isPlaying then
-            playbackConnection:Disconnect()
-            return
+-- REC INDICATOR
+local RecDot = Instance.new("Frame")
+RecDot.Size = UDim2.new(0, 10, 0, 10)
+RecDot.Position = UDim2.new(1, -70, 0, 13)
+RecDot.BackgroundColor3 = C.danger
+RecDot.BackgroundTransparency = 1
+RecDot.Parent = TitleBar
+corner(RecDot, 5)
+
+-- TABS
+local TabsBar = Instance.new("Frame")
+TabsBar.Size = UDim2.new(1, -20, 0, 32)
+TabsBar.Position = UDim2.new(0, 10, 0, 50)
+TabsBar.BackgroundColor3 = C.panel
+TabsBar.BorderSizePixel = 0
+TabsBar.Parent = Main
+corner(TabsBar, 6)
+
+local TabData = {
+    {name="Record", icon="⏺"},
+    {name="Playback", icon="▶"},
+    {name="Library", icon="📚"},
+}
+local TabBtns = {}
+local TabContents = {}
+
+local function switchTab(name)
+    for _, b in ipairs(TabBtns) do
+        if b.Name == name then
+            b.BackgroundColor3 = C.panel2
+            b.TextColor3 = C.accent
+        else
+            b.BackgroundColor3 = C.panel
+            b.TextColor3 = C.textDim
         end
-
-        local elapsed = tick() - playbackStart
-
-        -- Trova il frame corrispondente al tempo trascorso
-        local targetFrame = nil
-        for _, frame in ipairs(recordedFrames) do
-            if frame.time >= elapsed then
-                targetFrame = frame
-                break
-            end
-        end
-
-        if not targetFrame then
-            -- Fine della registrazione
-            isPlaying = false
-            playbackConnection:Disconnect()
-            controls:Enable()
-            print("Riproduzione completata.")
-            return
-        end
-
-        -- Applica la posizione (e la rotazione) del frame target
-        humanoidRootPart.CFrame = targetFrame.cframe
-    end)
+    end
+    for _, f in ipairs(TabContents) do f.Visible = (f.Name == name) end
 end
 
--- Input dell'utente per attivare le funzioni
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
+for i, td in ipairs(TabData) do
+    local b = Instance.new("TextButton")
+    b.Name = td.name
+    b.Size = UDim2.new(1/#TabData, -4, 1, -6)
+    b.Position = UDim2.new((i-1)/#TabData, 2, 0, 3)
+    b.BackgroundColor3 = C.panel
+    b.Text = td.icon.." "..td.name
+    b.TextColor3 = C.textDim
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 11
+    b.AutoButtonColor = false
+    b.Parent = TabsBar
+    corner(b, 5)
+    b.MouseButton1Click:Connect(function() switchTab(td.name) end)
+    table.insert(TabBtns, b)
+end
 
-    if input.KeyCode == RECORD_KEY then
-        toggleRecording()
-    elseif input.KeyCode == REPLAY_KEY then
-        playRecording()
+-- CONTENT AREA
+local Content = Instance.new("Frame")
+Content.Size = UDim2.new(1, -20, 1, -170)
+Content.Position = UDim2.new(0, 10, 0, 88)
+Content.BackgroundTransparency = 1
+Content.Parent = Main
+
+for _, td in ipairs(TabData) do
+    local f = Instance.new("Frame")
+    f.Name = td.name
+    f.Size = UDim2.new(1, 0, 1, 0)
+    f.BackgroundTransparency = 1
+    f.Visible = false
+    f.Parent = Content
+    table.insert(TabContents, f)
+end
+
+--============================================================
+-- TAB: RECORD
+--============================================================
+local RecTab = TabContents[1]
+
+local BigRecBtn = newBtn(RecTab, "⏺  START RECORDING", UDim2.new(1, 0, 0, 60), UDim2.new(0, 0, 0, 0), C.success)
+BigRecBtn.TextSize = 16
+BigRecBtn.Font = Enum.Font.GothamBold
+
+local RecTimeLabel = newLabel(RecTab, "00:00.00", UDim2.new(1, 0, 0, 40), UDim2.new(0, 0, 0, 68), C.accent, Enum.Font.Code, 32)
+RecTimeLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+local RecInfoLabel = newLabel(RecTab, "Premi START per iniziare", UDim2.new(1, 0, 0, 20), UDim2.new(0, 0, 0, 112), C.textDim, Enum.Font.Gotham, 12)
+RecInfoLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+local RecStatsFrame = Instance.new("Frame")
+RecStatsFrame.Size = UDim2.new(1, 0, 0, 90)
+RecStatsFrame.Position = UDim2.new(0, 0, 0, 145)
+RecStatsFrame.BackgroundColor3 = C.panel
+RecStatsFrame.BorderSizePixel = 0
+RecStatsFrame.Parent = RecTab
+corner(RecStatsFrame, 8)
+
+local function statRow(parent, y, label)
+    newLabel(parent, label, UDim2.new(0.5, -10, 0, 26), UDim2.new(0, 10, 0, y), C.textDim, Enum.Font.Gotham, 12)
+    local v = newLabel(parent, "0", UDim2.new(0.5, -10, 0, 26), UDim2.new(0.5, 0, 0, y), C.text, Enum.Font.GothamBold, 13)
+    v.TextXAlignment = Enum.TextXAlignment.Right
+    return v
+end
+local FramesVal = statRow(RecStatsFrame, 8,  "Frame registrati:")
+local EventsVal = statRow(RecStatsFrame, 34, "Eventi (jump/tool):")
+local SizeVal   = statRow(RecStatsFrame, 60, "Dimensione stimata:")
+
+local SaveAfterRec = newBtn(RecTab, "💾  Salva nella libreria", UDim2.new(1, 0, 0, 34), UDim2.new(0, 0, 0, 245), C.blue)
+SaveAfterRec.Visible = false
+
+local RecHint = newLabel(RecTab, "💡 Registra il movimento, i salti e i cambi d'arma.\nFunziona in qualsiasi gioco Roblox.", UDim2.new(1, 0, 0, 40), UDim2.new(0, 0, 1, -50), C.textDim, Enum.Font.Gotham, 11)
+RecHint.TextWrapped = true
+RecHint.TextYAlignment = Enum.TextYAlignment.Top
+
+--============================================================
+-- TAB: PLAYBACK
+--============================================================
+local PlayTab = TabContents[2]
+
+newLabel(PlayTab, "Registrazione selezionata:", UDim2.new(1, 0, 0, 18), UDim2.new(0, 0, 0, 0), C.textDim, Enum.Font.Gotham, 11)
+local PlaySelectedLabel = newLabel(PlayTab, "— nessuna —", UDim2.new(1, 0, 0, 26), UDim2.new(0, 0, 0, 20), C.accent, Enum.Font.GothamBold, 14)
+
+local PlayPlayBtn = newBtn(PlayTab, "▶  PLAY", UDim2.new(0.5, -5, 0, 46), UDim2.new(0, 0, 0, 55), C.success)
+PlayPlayBtn.TextSize = 14
+local PlayStopBtn = newBtn(PlayTab, "⏹ STOP", UDim2.new(0.5, -5, 0, 46), UDim2.new(0.5, 5, 0, 55), C.danger)
+PlayStopBtn.TextSize = 14
+
+-- Progress bar
+local ProgFrame = Instance.new("Frame")
+ProgFrame.Size = UDim2.new(1, 0, 0, 16)
+ProgFrame.Position = UDim2.new(0, 0, 0, 110)
+ProgFrame.BackgroundColor3 = C.panel
+ProgFrame.BorderSizePixel = 0
+ProgFrame.Parent = PlayTab
+corner(ProgFrame, 8)
+
+local ProgFill = Instance.new("Frame")
+ProgFill.Size = UDim2.new(0, 0, 1, 0)
+ProgFill.BackgroundColor3 = C.accent
+ProgFill.BorderSizePixel = 0
+ProgFill.Parent = ProgFrame
+corner(ProgFill, 8)
+
+local ProgLabel = newLabel(PlayTab, "0:00.00 / 0:00.00", UDim2.new(1, 0, 0, 18), UDim2.new(0, 0, 0, 130), C.textDim, Enum.Font.Code, 11)
+ProgLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+-- Speed slider
+newLabel(PlayTab, "Velocità:", UDim2.new(0, 70, 0, 18), UDim2.new(0, 0, 0, 160), C.textDim, Enum.Font.Gotham, 12)
+local SpeedValue = newLabel(PlayTab, "1.00x", UDim2.new(0, 60, 0, 18), UDim2.new(1, -60, 0, 160), C.accent, Enum.Font.GothamBold, 13)
+SpeedValue.TextXAlignment = Enum.TextXAlignment.Right
+
+local SpeedSlider = Instance.new("Frame")
+SpeedSlider.Size = UDim2.new(1, 0, 0, 22)
+SpeedSlider.Position = UDim2.new(0, 0, 0, 182)
+SpeedSlider.BackgroundColor3 = C.panel
+SpeedSlider.BorderSizePixel = 0
+SpeedSlider.Parent = PlayTab
+corner(SpeedSlider, 11)
+
+local SpeedFill = Instance.new("Frame")
+SpeedFill.Size = UDim2.new((1.0 - 0.25) / (4.0 - 0.25), 0, 1, 0)
+SpeedFill.BackgroundColor3 = C.accent
+SpeedFill.BorderSizePixel = 0
+SpeedFill.Parent = SpeedSlider
+corner(SpeedFill, 11)
+
+local SpeedKnob = Instance.new("Frame")
+SpeedKnob.Size = UDim2.new(0, 18, 0, 18)
+SpeedKnob.Position = UDim2.new((1.0 - 0.25) / (4.0 - 0.25), -9, 0, 2)
+SpeedKnob.BackgroundColor3 = C.accent2
+SpeedKnob.BorderSizePixel = 0
+SpeedKnob.Parent = SpeedSlider
+corner(SpeedKnob, 9)
+stroke(SpeedKnob, C.bg, 2)
+
+local function setSpeed(v)
+    v = math.clamp(v, 0.25, 4.0)
+    S.speed = v
+    local t = (v - 0.25) / (4.0 - 0.25)
+    TweenService:Create(SpeedFill, TweenInfo.new(0.1), {Size = UDim2.new(t, 0, 1, 0)}):Play()
+    TweenService:Create(SpeedKnob, TweenInfo.new(0.1), {Position = UDim2.new(t, -9, 0, 2)}):Play()
+    SpeedValue.Text = string.format("%.2fx", v)
+end
+
+local draggingSlider = false
+local function updateSliderFromX(mouseX)
+    local rel = (mouseX - SpeedSlider.AbsolutePosition.X) / SpeedSlider.AbsoluteSize.X
+    setSpeed(0.25 + math.clamp(rel, 0, 1) * (4.0 - 0.25))
+end
+SpeedSlider.InputBegan:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+        draggingSlider = true
+        updateSliderFromX(inp.Position.X)
     end
 end)
+UserInputService.InputChanged:Connect(function(inp)
+    if draggingSlider and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+        updateSliderFromX(inp.Position.X)
+    end
+end)
+UserInputService.InputEnded:Connect(function(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+        draggingSlider = false
+    end
+end)
+
+-- Loop toggle
+local LoopBtn = newBtn(PlayTab, "☐  Loop", UDim2.new(0.5, -5, 0, 32), UDim2.new(0, 0, 0, 216), C.panel2)
+local LoopCountLabel = newLabel(PlayTab, "Esecuzioni: 0", UDim2.new(0.5, -5, 0, 32), UDim2.new(0.5, 5, 0, 216), C.textDim, Enum.Font.Gotham, 12)
+LoopCountLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+LoopBtn.MouseButton1Click:Connect(function()
+    S.loop = not S.loop
+    LoopBtn.Text = (S.loop and "☑  Loop attivo" or "☐  Loop")
+    LoopBtn.BackgroundColor3 = S.loop and C.success or C.panel2
+end)
+
+local PlaybackStatus = newLabel(PlayTab, "Status: idle", UDim2.new(1, 0, 0, 20), UDim2.new(0, 0, 0, 260), C.textDim, Enum.Font.Gotham, 11)
+PlaybackStatus.TextXAlignment = Enum.TextXAlignment.Center
+
+--============================================================
+-- TAB: LIBRARY
+--============================================================
+local LibTab = TabContents[3]
+
+newLabel(LibTab, "Registrazioni salvate:", UDim2.new(1, 0, 0, 18), UDim2.new(0, 0, 0, 0), C.textDim, Enum.Font.Gotham, 11)
+
+local LibScroll = Instance.new("ScrollingFrame")
+LibScroll.Size = UDim2.new(1, 0, 0, 220)
+LibScroll.Position = UDim2.new(0, 0, 0, 22)
+LibScroll.BackgroundColor3 = C.panel
+LibScroll.BorderSizePixel = 0
+LibScroll.ScrollBarThickness = 6
+LibScroll.ScrollBarImageColor3 = C.accent
+LibScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+LibScroll.Parent = LibTab
+corner(LibScroll, 8)
+
+local LibEmpty = newLabel(LibScroll, "Nessuna registrazione salvata.\nRegistra qualcosa e premi 'Salva nella libreria'.", UDim2.new(1, -20, 0, 60), UDim2.new(0, 10, 0, 20), C.textDim, Enum.Font.Gotham, 12)
+LibEmpty.TextWrapped = true
+LibEmpty.TextYAlignment = Enum.TextYAlignment.Top
+
+local SaveAllBtn = newBtn(LibTab, "💾 Esporta tutte (console)", UDim2.new(0.5, -5, 0, 32), UDim2.new(0, 0, 0, 250), C.blue)
+local ClearAllBtn = newBtn(LibTab, "🗑 Elimina tutto", UDim2.new(0.5, -5, 0, 32), UDim2.new(0.5, 5, 0, 250), C.danger)
+
+--============================================================
+-- STATUS BAR (footer)
+--============================================================
+local Footer = Instance.new("Frame")
+Footer.Size = UDim2.new(1, -20, 0, 60)
+Footer.Position = UDim2.new(0, 10, 1, -68)
+Footer.BackgroundColor3 = C.panel
+Footer.BorderSizePixel = 0
+Footer.Parent = Main
+corner(Footer, 6)
+
+local StatusLabel = newLabel(Footer, "✅ Pronto", UDim2.new(1, -20, 0, 18), UDim2.new(0, 10, 0, 6), C.text, Enum.Font.Gotham, 11)
+local HintLabel   = newLabel(Footer, "Xeno Recorder • Registra e riproduci azioni", UDim2.new(1, -20, 0, 16), UDim2.new(0, 10, 0, 26), C.textDim, Enum.Font.Gotham, 10)
+local ShortcutLabel = newLabel(Footer, "F1: start/stop record  |  F2: play/stop", UDim2.new(1, -20, 0, 16), UDim2.new(0, 10, 0, 42), C.textDim, Enum.Font.Gotham, 10)
+
+local function setStatus(txt, col)
+    StatusLabel.Text = txt
+    StatusLabel.TextColor3 = col or C.text
+end
+
+--============================================================
+-- LIBRERIA: UI RENDER
+--============================================================
+local function refreshLibrary()
+    for _, c in ipairs(LibScroll:GetChildren()) do
+        if c:IsA("Frame") and c.Name ~= "XenoEmpty" then c:Destroy() end
+    end
+    LibEmpty.Visible = #S.saved == 0
+
+    local y = 6
+    for i, rec in ipairs(S.saved) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, -12, 0, 42)
+        row.Position = UDim2.new(0, 6, 0, y)
+        row.BackgroundColor3 = C.panel2
+        row.BorderSizePixel = 0
+        row.Parent = LibScroll
+        corner(row, 6)
+
+        newLabel(row, rec.name, UDim2.new(0.6, -10, 0, 20), UDim2.new(0, 8, 0, 2), C.accent, Enum.Font.GothamBold, 13)
+        newLabel(row, string.format("⏱ %.1fs  •  %d frame", rec.duration, #rec.frames),
+            UDim2.new(0.6, -10, 0, 16), UDim2.new(0, 8, 0, 22), C.textDim, Enum.Font.Gotham, 10)
+
+        local loadBtn = newBtn(row, "▶ Play", UDim2.new(0, 60, 0, 28), UDim2.new(1, -140, 0, 7), C.success, function()
+            S.playbackRec = rec
+            PlaySelectedLabel.Text = rec.name
+            switchTab("Playback")
+            setStatus("Selezionata: "..rec.name, C.blue)
+        end)
+        loadBtn.TextSize = 11
+
+        local delBtn = newBtn(row, "🗑", UDim2.new(0, 32, 0, 28), UDim2.new(1, -72, 0, 7), C.danger, function()
+            table.remove(S.saved, i)
+            refreshLibrary()
+            setStatus("Registrazione eliminata", C.warning)
+        end)
+        delBtn.TextSize = 12
+
+        y = y + 48
+    end
+    LibScroll.CanvasSize = UDim2.new(0, 0, 0, y + 10)
+end
+
+--============================================================
+-- RECORDING LOGIC
+--============================================================
+local function startRecording()
+    if S.playing then return end
+    S.recording = true
+    S.recFrames = {}
+    S.recEvents = {}
+    S.recStartTime = os.clock()
+    S.lastRecTime = 0
+    S.lastJump = false
+    S.lastTool = nil
+    SaveAfterRec.Visible = false
+    BigRecBtn.Text = "⏹  STOP RECORDING"
+    BigRecBtn.BackgroundColor3 = C.danger
+    RecDot.BackgroundTransparency = 0
+    setStatus("Registrazione in corso...", C.danger)
+    RecInfoLabel.Text = "🔴 Registrando... muoviti e usa i tool"
+end
+
+local function stopRecording()
+    S.recording = false
+    BigRecBtn.Text = "⏺  START RECORDING"
+    BigRecBtn.BackgroundColor3 = C.success
+    RecDot.BackgroundTransparency = 1
+    local duration = #S.recFrames > 0 and S.recFrames[#S.recFrames].t or 0
+    if duration > 0.5 then
+        SaveAfterRec.Visible = true
+        setStatus(string.format("Registrazione finita (%.1fs, %d frame) → salva", duration, #S.recFrames), C.success)
+        RecInfoLabel.Text = "✅ Registrazione pronta. Salvala nella libreria."
+    else
+        setStatus("Registrazione troppo corta", C.warning)
+        RecInfoLabel.Text = "Registrazione troppo corta, riprova."
+    end
+    FramesVal.Text = tostring(#S.recFrames)
+    EventsVal.Text = tostring(#S.recEvents)
+end
+
+-- Sample loop
+local lastSample = 0
+RunService.Heartbeat:Connect(function()
+    if not S.recording then return end
+    local now = os.clock() - S.recStartTime
+    if now - S.lastRecTime < 1/S.recordRate then return end
+    S.lastRecTime = now
+
+    local root = getRoot()
+    local hum = getHum()
+    if not root then return end
+
+    local cf = root.CFrame
+    local jumping = hum and (hum:GetState() == Enum.HumanoidStateType.Jumping or hum:GetState() == Enum.HumanoidStateType.Freefall) and hum.Jump == true
+    local ch = LP.Character
+    local tool = ch and ch:FindFirstChildOfClass("Tool")
+    local toolName = tool and tool.Name or nil
+
+    if jumping and not S.lastJump then
+        table.insert(S.recEvents, {t=now, type="jump"})
+    end
+    S.lastJump = jumping
+
+    if toolName ~= S.lastTool then
+        table.insert(S.recEvents, {t=now, type="tool", name=toolName})
+        S.lastTool = toolName
+    end
+
+    table.insert(S.recFrames, {t=now, cf=cf})
+
+    -- Update UI once per ~0.1s
+    if now - lastSample > 0.1 then
+        lastSample = now
+        RecTimeLabel.Text = fmtTime(now)
+        FramesVal.Text = tostring(#S.recFrames)
+        EventsVal.Text = tostring(#S.recEvents)
+        local bytes = #S.recFrames * 100 -- rough estimate
+        SizeVal.Text = string.format("%.1f KB", bytes / 1024)
+    end
+end)
+
+--============================================================
+-- PLAYBACK LOGIC
+--============================================================
+local function startPlayback()
+    if S.playing or not S.playbackRec then return end
+    if #S.playbackRec.frames == 0 then setStatus("Registrazione vuota", C.warning); return end
+    S.playing = true
+    S.playbackStart = os.clock()
+    S.playbackIdx = 1
+    S.playbackEvtIdx = 1
+    S.loopCount = 0
+    setStatus("Playback avviato: "..S.playbackRec.name, C.success)
+    PlaybackStatus.Text = "▶ Playing "..S.playbackRec.name
+    PlayPlayBtn.BackgroundColor3 = C.warning
+    PlayPlayBtn.Text = "⏸ PAUSA"
+end
+
+local function stopPlayback(resetStatus)
+    S.playing = false
+    PlayPlayBtn.Text = "▶  PLAY"
+    PlayPlayBtn.BackgroundColor3 = C.success
+    if resetStatus ~= false then
+        setStatus("Playback fermato", C.warning)
+    end
+    PlaybackStatus.Text = "Status: idle"
+    ProgFill.Size = UDim2.new(0, 0, 1, 0)
+    ProgLabel.Text = "0:00.00 / 0:00.00"
+end
+
+RunService.Heartbeat:Connect(function()
+    if not S.playing or not S.playbackRec then return end
+    local rec = S.playbackRec
+    local elapsed = (os.clock() - S.playbackStart) * S.speed
+
+    -- FIRE EVENTS
+    while S.playbackEvtIdx <= #rec.events do
+        local ev = rec.events[S.playbackEvtIdx]
+        if ev.t > elapsed then break end
+        if ev.type == "jump" then
+            local hum = getHum()
+            if hum then hum.Jump = true end
+        elseif ev.type == "tool" then
+            local ch = LP.Character
+            local bp = LP:FindFirstChild("Backpack")
+            if ch and bp then
+                local hum = ch:FindFirstChildOfClass("Humanoid")
+                local current = ch:FindFirstChildOfClass("Tool")
+                if ev.name then
+                    local target = bp:FindFirstChild(ev.name) or ch:FindFirstChild(ev.name)
+                    if target and hum and (not current or current.Name ~= ev.name) then
+                        hum:EquipTool(target)
+                    end
+                else
+                    if current then hum:UnequipTools() end
+                end
+            end
+        end
+        S.playbackEvtIdx = S.playbackEvtIdx + 1
+    end
+
+    -- INTERPOLATE POSITION
+    local frames = rec.frames
+    while S.playbackIdx < #frames and frames[S.playbackIdx + 1].t <= elapsed do
+        S.playbackIdx = S.playbackIdx + 1
+    end
+
+    local root = getRoot()
+    if root then
+        if S.playbackIdx < #frames then
+            local f1 = frames[S.playbackIdx]
+            local f2 = frames[S.playbackIdx + 1]
+            local alpha = (elapsed - f1.t) / math.max(0.001, f2.t - f1.t)
+            alpha = math.clamp(alpha, 0, 1)
+            root.CFrame = f1.cf:Lerp(f2.cf, alpha)
+        else
+            root.CFrame = frames[S.playbackIdx].cf
+        end
+    end
+
+    -- UPDATE PROGRESS
+    if os.clock() - S.lastProgressUpdate > 0.05 then
+        S.lastProgressUpdate = os.clock()
+        local pct = math.clamp(elapsed / math.max(0.001, rec.duration), 0, 1)
+        ProgFill.Size = UDim2.new(pct, 0, 1, 0)
+        ProgLabel.Text = fmtTime(math.min(elapsed, rec.duration)).." / "..fmtTime(rec.duration)
+    end
+
+    -- END
+    if elapsed >= rec.duration then
+        if S.loop then
+            S.playbackStart = os.clock()
+            S.playbackIdx = 1
+            S.playbackEvtIdx = 1
+            S.loopCount = S.loopCount + 1
+            S.totalRuns = S.totalRuns + 1
+            LoopCountLabel.Text = "Esecuzioni: "..S.totalRuns
+        else
+            S.totalRuns = S.totalRuns + 1
+            LoopCountLabel.Text = "Esecuzioni: "..S.totalRuns
+            stopPlayback()
+            setStatus("Playback completato", C.success)
+        end
+    end
+end)
+
+--============================================================
+-- SAVE / EXPORT
+--============================================================
+local function saveRecordingToLibrary()
+    if #S.recFrames < 2 then setStatus("Nessuna registrazione", C.warning); return end
+    local name = "rec_"..os.date("%H%M%S")
+    local duration = S.recFrames[#S.recFrames].t
+    table.insert(S.saved, {
+        name = name,
+        frames = S.recFrames,
+        events = S.recEvents,
+        duration = duration,
+    })
+    refreshLibrary()
+    setStatus("✅ Salvata: "..name, C.success)
+    RecInfoLabel.Text = "✅ Salvata come "..name
+    SaveAfterRec.Visible = false
+
+    -- Try to persist via writefile
+    if writefile then
+        pcall(function()
+            if not (isfolder and isfolder("xeno_recorder")) then
+                if makefolder then makefolder("xeno_recorder") end
+            end
+            local data = {name=name, duration=duration, events={}, frames={}}
+            for _, f in ipairs(S.recEvents) do table.insert(data.events, f) end
+            for _, f in ipairs(S.recFrames) do
+                table.insert(data.frames, {t=f.t, cf={f.cf:GetComponents()}})
+            end
+            writefile("xeno_recorder/"..name..".json", HttpService:JSONEncode(data))
+        end)
+    end
+end
+
+SaveAfterRec.MouseButton1Click:Connect(saveRecordingToLibrary)
+
+SaveAllBtn.MouseButton1Click:Connect(function()
+    if #S.saved == 0 then setStatus("Libreria vuota", C.warning); return end
+    local out = {}
+    for _, rec in ipairs(S.saved) do
+        local data = {name=rec.name, duration=rec.duration, frames={}, events=rec.events}
+        for _, f in ipairs(rec.frames) do
+            table.insert(data.frames, {t=f.t, cf={f.cf:GetComponents()}})
+        end
+        table.insert(out, data)
+    end
+    local json = HttpService:JSONEncode(out)
+    print("[XenoRecorder] Export registrazioni:")
+    print(json)
+    if setclipboard then
+        pcall(setclipboard, json)
+        setStatus("✅ Esportato in console + clipboard", C.success)
+    else
+        setStatus("✅ Esportato in console (F9)", C.success)
+    end
+end)
+
+ClearAllBtn.MouseButton1Click:Connect(function()
+    S.saved = {}
+    refreshLibrary()
+    setStatus("Libreria svuotata", C.warning)
+end)
+
+--============================================================
+-- BUTTONS
+--============================================================
+BigRecBtn.MouseButton1Click:Connect(function()
+    if S.recording then stopRecording() else startRecording() end
+end)
+
+PlayPlayBtn.MouseButton1Click:Connect(function()
+    if S.playing then stopPlayback() else startPlayback() end
+end)
+PlayStopBtn.MouseButton1Click:Connect(function() stopPlayback() end)
+
+--============================================================
+-- HOTKEYS (F1 = record toggle, F2 = play toggle)
+--============================================================
+UserInputService.InputBegan:Connect(function(inp, gpe)
+    if gpe then return end
+    if inp.KeyCode == Enum.KeyCode.F1 then
+        if S.recording then stopRecording() else startRecording() end
+    elseif inp.KeyCode == Enum.KeyCode.F2 then
+        if S.playing then stopPlayback() else startPlayback() end
+    end
+end)
+
+--============================================================
+-- RESPAWN HANDLER
+--============================================================
+LP.CharacterAdded:Connect(function()
+    if S.recording then
+        local now = os.clock() - S.recStartTime
+        table.insert(S.recEvents, {t=now, type="respawn"})
+    end
+end)
+
+--============================================================
+-- INIT
+--============================================================
+switchTab("Record")
+refreshLibrary()
+setStatus("✅ Pronto — premi F1 o il pulsante per registrare", C.success)
+print("[XenoRecorder] Caricato. F1=record, F2=play.")
