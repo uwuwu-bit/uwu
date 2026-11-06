@@ -1,0 +1,147 @@
+--[[
+    SCRIPT DI REGISTRAZIONE E RIPRODUZIONE MOVIMENTI
+    ------------------------------------------------
+    Questo script registra la posizione del tuo personaggio mentre ti muovi
+    e poi la riproduce esattamente come l'hai eseguita.
+
+    ISTRUZIONI:
+    1. Incolla questo script in un "LocalScript" dentro StarterPlayer > StarterPlayerScripts.
+    2. Premi E per iniziare/fermare la registrazione.
+    3. Premi R per riprodurre la registrazione.
+    4. I dati vengono salvati in una tabella; puoi stamparli o salvarli su GitHub.
+
+    NOTA: Questo è un esempio didattico. Per funzionalità avanzate (animazioni,
+    input, loop, ecc.) puoi estendere il codice o usare framework come ReplayCore.
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+
+-- Configurazione tasti
+local RECORD_KEY = Enum.KeyCode.E
+local REPLAY_KEY = Enum.KeyCode.R
+
+-- Stato
+local isRecording = false
+local isPlaying = false
+local recordedFrames = {} -- Ogni frame: {time = number, position = Vector3, cframe = CFrame}
+
+local startTime = 0
+local recordConnection = nil
+
+-- Funzione per iniziare/fermare la registrazione
+local function toggleRecording()
+    if isPlaying then
+        warn("Impossibile registrare durante la riproduzione.")
+        return
+    end
+
+    isRecording = not isRecording
+
+    if isRecording then
+        recordedFrames = {}
+        startTime = tick()
+        print("Registrazione avviata. Muoviti pure!")
+
+        -- Connessione a RenderStepped per catturare la posizione ogni frame
+        recordConnection = RunService.RenderStepped:Connect(function()
+            if not character or not humanoidRootPart then return end
+
+            local currentTime = tick() - startTime
+            local currentCFrame = humanoidRootPart.CFrame
+            local currentPosition = humanoidRootPart.Position
+
+            table.insert(recordedFrames, {
+                time = currentTime,
+                position = currentPosition,
+                cframe = currentCFrame,
+            })
+        end)
+    else
+        -- Ferma la registrazione
+        if recordConnection then
+            recordConnection:Disconnect()
+            recordConnection = nil
+        end
+
+        print(("Registrazione fermata. Frame catturati: %d"):format(#recordedFrames))
+        -- Qui puoi esportare `recordedFrames` (es. stamparli in JSON) per salvarli su GitHub
+    end
+end
+
+-- Funzione per riprodurre la registrazione
+local function playRecording()
+    if isRecording then
+        warn("Impossibile riprodurre durante la registrazione.")
+        return
+    end
+
+    if #recordedFrames == 0 then
+        warn("Nessuna registrazione disponibile.")
+        return
+    end
+
+    if isPlaying then
+        warn("Riproduzione già in corso.")
+        return
+    end
+
+    isPlaying = true
+    print("Riproduzione avviata...")
+
+    -- Disabilita i controlli del giocatore per evitare conflitti
+    local playerScripts = player:WaitForChild("PlayerScripts")
+    local playerModule = require(playerScripts:WaitForChild("PlayerModule"))
+    local controls = playerModule:GetControls()
+    controls:Disable()
+
+    -- Ciclo attraverso i frame registrati e imposta la posizione al momento giusto
+    local playbackStart = tick()
+    local playbackConnection
+
+    playbackConnection = RunService.RenderStepped:Connect(function()
+        if not isPlaying then
+            playbackConnection:Disconnect()
+            return
+        end
+
+        local elapsed = tick() - playbackStart
+
+        -- Trova il frame corrispondente al tempo trascorso
+        local targetFrame = nil
+        for _, frame in ipairs(recordedFrames) do
+            if frame.time >= elapsed then
+                targetFrame = frame
+                break
+            end
+        end
+
+        if not targetFrame then
+            -- Fine della registrazione
+            isPlaying = false
+            playbackConnection:Disconnect()
+            controls:Enable()
+            print("Riproduzione completata.")
+            return
+        end
+
+        -- Applica la posizione (e la rotazione) del frame target
+        humanoidRootPart.CFrame = targetFrame.cframe
+    end)
+end
+
+-- Input dell'utente per attivare le funzioni
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+
+    if input.KeyCode == RECORD_KEY then
+        toggleRecording()
+    elseif input.KeyCode == REPLAY_KEY then
+        playRecording()
+    end
+end)
